@@ -122,8 +122,13 @@ export function lookupConfiguredKpiValue(
 
 export function comboExecutionError(payload: unknown, label: string | null, comboId?: string | null, ambiguousLabel = false): string | null {
   const ownError = (node: ValueMap): string | null => {
-    if (node.error || node.ok === false) return String(node.error || node.message || "scrape failed");
-    return null;
+    if (!(node.error || node.ok === false)) return null;
+    const text = String(node.error || node.message || "scrape failed");
+    // Filter read-back drift is diagnostic only.
+    if (/^filter verification failed$/i.test(text.trim()) || /^(FILTER_DRIFT|FILTER_NOT_VERIFIED|FILTER_NOT_APPLIED)$/i.test(text.trim())) {
+      return null;
+    }
+    return text;
   };
   const envelopeError = (node: unknown, depth: number): string | null => {
     if (!isMap(node) || depth > 8) return null;

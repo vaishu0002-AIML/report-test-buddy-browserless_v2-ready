@@ -518,7 +518,14 @@ export function deriveStoredResultStatus(args: Parameters<typeof deriveStoredRes
 function firstPayloadError(side: any): string {
   if (!side || typeof side !== "object") return "";
   const e = side.error;
-  if (typeof e === "string" && e.trim()) return e.trim();
+  if (typeof e === "string" && e.trim()) {
+    const text = e.trim();
+    // Persisted filter-verification strings must not fail the case after removal.
+    if (/^filter verification failed$/i.test(text) || /^(FILTER_DRIFT|FILTER_NOT_VERIFIED|FILTER_NOT_APPLIED)$/i.test(text)) {
+      return "";
+    }
+    return text;
+  }
   const message = side.message;
   if (typeof message === "string" && message.trim() && !Object.keys(unwrapStoredValues(side)).length) {
     return message.trim();

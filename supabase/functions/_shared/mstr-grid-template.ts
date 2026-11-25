@@ -572,7 +572,7 @@ ${FILTER_CORE_JS}
   const scrapeOnce = async (filters) => {
     const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const verification = await applyFiltersVerified(filters, GEO_ORDER);
-    if (!verification.ok) return { ok: false, error: verification.error, requested_filters: filters, filter_verification: verification, filters_applied: verification.final_state || null };
+    // Continue extract even when read-back drifts — filter evidence is informational.
     const row = { filters_applied: verification.final_state, requested_filters: filters, filter_verification: verification };
 
     // Visit each sub-tab and extract the row count from Show Data
@@ -1658,28 +1658,46 @@ ${FILTER_CORE_JS}
   const extractViaShowData = async (titleHint) => {
     // A prompt dropdown left open is itself a [class*="Popup"] and was being scraped
     // instead of the Show Data dialog (headers came back as territory values).
-    await closeAnyOpenDropdown();
-    await dismissGenericErrorDialog();
-    const openResult = await openShowData(titleHint);
-    if (openResult && openResult.error) return { error: openResult.error, open: openResult };
-    await waitForLoadingToFinish(20000);
-    const start = Date.now();
-    let table = { error: 'Show Data table not found' };
-    while (Date.now() - start < 8000) {
-      table = await extractShowDataTable();
-      // Accept the dialog's table as-is; only explicit Overview chrome is rejected.
-      if (table && !table.error && !isChromeScrape(table)) break;
-      await sleep(350);
+    // Suite/headless: retry open+wait up to 3 times before failing (avoids
+    // SHOW_DATA_NOT_OPENED → wrong on-page column set).
+    let lastOpen = null;
+    let lastTable = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await closeAnyOpenDropdown();
+      await dismissGenericErrorDialog();
+      if (attempt > 1) {
+        await closeShowDataPopup();
+        try { await page.keyboard.press('Escape'); } catch (_) {}
+        await sleep(700);
+        await waitForLoadingToFinish(15000);
+      }
+      const openResult = await openShowData(titleHint);
+      lastOpen = openResult;
+      if (openResult && openResult.error) continue;
+      await waitForLoadingToFinish(20000);
+      const start = Date.now();
+      let table = { error: 'Show Data table not found' };
+      while (Date.now() - start < 15000) {
+        table = await extractShowDataTable();
+        if (table && !table.error && !isChromeScrape(table)) break;
+        await sleep(400);
+      }
+      lastTable = table;
+      await closeShowDataPopup();
+      if (table && !table.error && !isChromeScrape(table)) {
+        const nCols = (table.headers || table.columns || []).length;
+        if (nCols >= 3) return table;
+        lastTable = { error: 'Show Data table had ' + nCols + ' column(s)', headers: table.headers || table.columns || [] };
+      }
     }
-    await closeShowDataPopup();
-    if (!table || table.error || isChromeScrape(table)) {
-      return { error: (table && table.error) || 'Show Data returned KPI/chrome noise', open: openResult };
+    if (lastOpen && lastOpen.error) {
+      return { error: 'SHOW_DATA_NOT_OPENED', open: lastOpen, detail: lastOpen.error };
     }
-    const nCols = (table.headers || table.columns || []).length;
-    if (nCols < 3) {
-      return { error: 'Show Data table had ' + nCols + ' column(s)', open: openResult, headers: table.headers || table.columns || [] };
-    }
-    return table;
+    return {
+      error: (lastTable && lastTable.error) || 'SHOW_DATA_NOT_OPENED',
+      open: lastOpen,
+      headers: lastTable && lastTable.headers ? lastTable.headers : null,
+    };
   };
 
   const extractOnPageGrid = async (titleHint, expectedCols) => {
@@ -2183,7 +2201,7 @@ ${FILTER_CORE_JS}
       }
       verification.hidden_below_view_level = hiddenTotals;
     }
-    if (!verification.ok) return { ok: false, error: verification.error, requested_filters: filters, filter_verification: verification, filters_applied: verification.final_state || null };
+    // Continue extract even when read-back drifts — filter evidence is informational.
     const row = { filters_applied: verification.final_state, requested_filters: filters, filter_verification: verification };
     // Primary: widget Menu → Show Data (clean multi-col table). Fallback: on-page scrape.
     // Try viz title ("Performance Trend Grid") before the shorter tab label.

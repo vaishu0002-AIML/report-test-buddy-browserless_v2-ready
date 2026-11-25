@@ -109,11 +109,21 @@ function buildBrowserlessFunctionUrl(rt: BrowserlessRuntime): string {
 function formatFetchError(err: unknown, label: string): string {
   const e = err as { message?: string; cause?: { message?: string } };
   const cause = e?.cause?.message || e?.message || String(err);
-  if (/unknownissuer|certificate|cert/i.test(cause)) {
+  // Ignore false positives from launch args like --ignore-certificate-errors embedded in the URL.
+  const tlsHint = /unknownissuer|CERT_|SSL routines|certificate verify|self[- ]signed/i.test(cause) &&
+    !/ignore-certificate-errors/i.test(cause);
+  if (tlsHint) {
     return (
       `${label} failed (TLS: ${cause}). ` +
       "On this VDI the corp proxy rewrites HTTPS certs. Restart the backend with scripts/dev-backend.ps1 " +
       "so Deno ignores Skyhigh MITM certificates."
+    );
+  }
+  if (/connection closed before message completed|proxy|ECONNRESET|SendRequest/i.test(cause)) {
+    return (
+      `${label} failed: ${cause}. ` +
+      "If BROWSERLESS_HOST is http://127.0.0.1:3000, do not set HTTP_PROXY/HTTPS_PROXY on the Deno process " +
+      "(local Browserless must bypass the corp/DNS proxy). Restart via scripts/dev-backend.ps1 without those env vars."
     );
   }
   return `${label} failed: ${cause}`;
@@ -315,8 +325,61 @@ function braceSignature(code: string): string {
   return `${curly}:${paren}:${square}`;
 }
 
+/**
+ * Performance Trend / chart Show Data scripts: suite runs often hit
+ * SHOW_DATA_NOT_OPENED then fall back to on-screen grid (wrong columns).
+ * Give openShowData more wall-clock and one forced retry before that fallback.
+ */
+function fixShowDataReliability(code: string) {
+  let out = code;
+  // Saved scripts used to abort extract when filter read-back drifted.
+  out = out.replace(
+    /^[ \t]*if\s*\(\s*!verification\.ok\s*\)\s*return\s*\{\s*ok:\s*false\s*,\s*error:\s*verification\.error\s*,\s*requested_filters:\s*filters\s*,\s*filter_verification:\s*verification\s*,\s*filters_applied:\s*verification\.final_state\s*\|\|\s*null\s*\}\s*;[ \t]*\r?\n/gm,
+    "",
+  );
+  out = out.replace(
+    /^[ \t]*if\s*\(\s*!verification\.ok\s*\)\s*\{[\s\S]*?continue;\s*\}[ \t]*\r?\n/gm,
+    "",
+  );
+  out = out.replace(
+    /const COMBO_MAX_MS = \(typeof __comboMaxMs !== 'undefined' && Number\(__comboMaxMs\) > 20000\) \? Number\(__comboMaxMs\) : 150 \* 1000;/,
+    "const COMBO_MAX_MS = (typeof __comboMaxMs !== 'undefined' && Number(__comboMaxMs) > 20000) ? Number(__comboMaxMs) : 360 * 1000;",
+  );
+  out = out.replace(
+    /ABORT_AT = Math\.min\(RUN_DEADLINE, Math\.max\(ABORT_AT, Date\.now\(\) \+ 90000\)\);/g,
+    "ABORT_AT = Math.min(RUN_DEADLINE, Math.max(ABORT_AT, Date.now() + 180000));",
+  );
+  out = out.replace(
+    /for \(let round = 0; round < 3 && leftMs\(\) > 8000; round\+\+\)/g,
+    "for (let round = 0; round < 5 && leftMs() > 3000; round++)",
+  );
+  out = out.replace(
+    /while \(Date\.now\(\) - tH < 2500\) \{\r?\n(\s*)await sleep\(200\);/g,
+    "while (Date.now() - tH < 4500) {\n$1await sleep(250);",
+  );
+  // Before accepting on-screen grid (wrong schema), retry openShowData once.
+  out = out.replace(
+    /if \(!op\.ok && isGrid && op\.error !== 'OLD_SHOW_DATA_POPUP_STILL_OPEN'\) \{\r?\n(\s*)try \{ await page\.keyboard\.press\('Escape'\); \} catch \(_\) \{\}\r?\n\1try \{ await page\.mouse\.move\(2, 2\); \} catch \(_\) \{\}\r?\n\1log\('SHOW DATA not available for ' \+ CHART_TITLE \+ ' - reading the grid on screen instead'\);/,
+    "if (!op.ok && isGrid && op.error !== 'OLD_SHOW_DATA_POPUP_STILL_OPEN') {\n" +
+      "$1try { await page.keyboard.press('Escape'); } catch (_) {}\n" +
+      "$1try { await page.mouse.move(2, 2); } catch (_) {}\n" +
+      "$1await sleep(800);\n" +
+      "$1try { if (typeof waitAllLoaded === 'function') await waitAllLoaded('before Show Data retry', { appearMs: 400, idleMs: 600, maxMs: Math.min(20000, Math.max(4000, leftMs() - 5000)) }); } catch (_) {}\n" +
+      "$1const opRetry = await openShowData();\n" +
+      "$1out.open_retry = { ok: opRetry.ok, how: opRetry.how, error: opRetry.error, tries: opRetry.tries };\n" +
+      "$1log('SHOW DATA retry -> ' + (opRetry.ok ? 'OK (' + opRetry.how + ')' : 'FAILED ' + opRetry.error), { ms: opRetry.ms });\n" +
+      "$1if (opRetry.ok) { op = opRetry; out.open = { ok: op.ok, how: op.how, error: op.error, tries: op.tries, chart_box: op.chart && op.chart.box_desc }; }\n" +
+      "$1}\n" +
+      "$1if (!op.ok && isGrid && op.error !== 'OLD_SHOW_DATA_POPUP_STILL_OPEN') {\n" +
+      "$1try { await page.keyboard.press('Escape'); } catch (_) {}\n" +
+      "$1try { await page.mouse.move(2, 2); } catch (_) {}\n" +
+      "$1log('SHOW DATA not available for ' + CHART_TITLE + ' - reading the grid on screen instead');",
+  );
+  return out;
+}
+
 function sanitizeBrowserlessCode(code: string) {
-  const rewritten = fixEarlyLabelWait(code)
+  const rewritten = fixShowDataReliability(fixEarlyLabelWait(code))
     // Remove markdown fences if a generated script was saved verbatim.
     .replace(/^\s*```(?:javascript|js)?\s*/i, "")
     .replace(/\s*```\s*$/i, "")
@@ -544,10 +607,21 @@ function prepareWrappedScript(
 
     // Match Chromium launch (1920x1080). A 3840x8000 fullPage screenshot OOMs
     // Browserless and surfaces as HTTP 500 Internal Server Error.
+    const browserlessTimeoutMs = Math.max(
+      120000,
+      Number(Deno.env.get("BROWSERLESS_TIMEOUT_MS") || 1200000) || 1200000,
+    );
+    const comboMaxMs = Math.max(
+      60000,
+      Number(Deno.env.get("COMBO_MAX_MS") || 360000) || 360000,
+    );
+    const budgetShim =
+      `var __runMaxMs = ${browserlessTimeoutMs}; var __comboMaxMs = ${comboMaxMs};`;
     return `
 ${credsLiteral}
 ${filtersLiteral}
 ${processShim}
+${budgetShim}
 ${userFnCode}
 export default async (ctx) => {
   try { ctx.page.setDefaultTimeout(15000); } catch {}

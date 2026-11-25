@@ -54,5 +54,5 @@ Label absent from this dossier → skipped_filters + on_screen_selection. Label 
 5) If getHelper already has popup-scope + exact Total + read-back + strict abort and chips still fail → say Regenerate from template; do not change playwright-runtime.
 
 ## Fail checklist
-filters_applied verified? page marker? null → empty_tiles / popup_lines / tried menus; wrong values → hidden duplicate / wrong box; spinner hang → close dropdowns, cap waits.
+page marker? null extract → empty_tiles / popup_lines / tried menus; wrong values → hidden duplicate / wrong box; spinner hang → close dropdowns, cap waits. Filter read-back is diagnostic only — do not abort extract on drift.
 `;

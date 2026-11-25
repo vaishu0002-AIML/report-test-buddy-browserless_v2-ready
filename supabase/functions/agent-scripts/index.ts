@@ -1024,8 +1024,7 @@ the same generic loop:
   const geoKeys = GEO_ORDER.filter(k => allKeys.includes(k));
   const otherKeys = allKeys.filter(k => !GEO_ORDER.includes(k));
   const verification = await applyFiltersVerified(filters, GEO_ORDER);
-  if (!verification.ok) return { ok: false, error: verification.error, requested_filters: filters, filter_verification: verification, filters_applied: verification.final_state || null };
-  // Extract only after final observed verification; persist verification.final_state.
+  // Persist verification.final_state; continue extract even if read-back drifts.
 
 
 ═══════════════════════════════════════════════════════

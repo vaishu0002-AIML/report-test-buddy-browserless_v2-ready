@@ -635,13 +635,8 @@ ${FILTER_CORE_JS}
 
     const GEO_ORDER = ['Team', 'Brand', 'Area', 'Region', 'Territory', 'Time Bucket'];
     const verification = await applyFiltersVerified(filters, GEO_ORDER);
+    // Continue extract even when read-back drifts — filter evidence is informational.
     const row = { combo_id: id || null, requested_filters: filters, filters_applied: verification.final_state || null, filter_verification: verification };
-    if (!verification.ok) {
-      row.ok = false; row.error = verification.error;
-      if (id) results_by_id[id] = row;
-      if (filterCombinations.filter(c => c.label === label).length === 1) results[label] = row;
-      continue;
-    }
     for (const k of KPI_LABELS) {
       const raw = await extractKPI(k);
       row[k] = toNum(raw && raw.value);

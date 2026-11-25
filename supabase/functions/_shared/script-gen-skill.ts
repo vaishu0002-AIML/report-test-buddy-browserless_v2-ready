@@ -60,7 +60,7 @@ FIXED (copy from working templates — do not rewrite):
   4) Navigate NAV_STEPS via clickByText (pages/tabs the user named)
   5) waitForDashboard / filter bar on THAT page
   6) Apply filters: GEO_ORDER Team→Brand→Area→Region→Territory→Time Bucket then others;
-     applyFiltersVerified from the RTB FILTER CORE; stop on any failed pick or final drift
+     applyFiltersVerified from the RTB FILTER CORE (persist evidence; still extract on drift)
   7) Wait data load
   8) Extract by kind ONLY (see above)
 
@@ -85,9 +85,9 @@ FILTER CORE IS MANDATORY AND VERBATIM (mstr-filter-core.ts, block marked
     (__rtbWaitDependent). A spinner wait is not enough and races MSTR's prompt
     re-resolution into "An error has occurred".
   - Call applyFiltersVerified for the whole combination immediately before extraction.
-    On failure return ok:false and requested/observed per-key evidence; never extract.
-    Save filters_applied only from verified final_state. Emit results_by_id[combo.id]
-    with combo_id, keeping labels only for unique legacy display support.
+    Persist filter_verification evidence and filters_applied from final_state, but still
+    extract even when read-back drifts (verification is informational only).
+    Emit results_by_id[combo.id] with combo_id, keeping labels only for unique legacy display support.
   - Call __rtbCheckErrorDialog() after filter steps and before extracting.
     Never extract values while that modal is up.
 

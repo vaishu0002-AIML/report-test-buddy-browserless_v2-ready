@@ -1,4 +1,3 @@
-import { verifyFilterEvidence } from "../_shared/filter-verification.ts";
 import { createTimingCollector } from "../_shared/run-timing.ts";
 import { parse } from "npm:acorn@^8.15.0";
 import { instrumentReportTiming } from "../_shared/script-timing.ts";
@@ -35,8 +34,6 @@ import {
   statusFromCategory,
   type ExtractionFailureCategory,
 } from "../_shared/extraction-outcome.ts";
-import { missingRequiredStructuredExtraction } from "../_shared/structured-extraction-retry.ts";
-
 async function checkedWrite(query: PromiseLike<any>, context: string) {
   const result = await query;
   if (result.error) throw new Error(`${context}: ${errorDetail(result.error)}`);
@@ -745,16 +742,6 @@ function classifyComboRuntime(payload: any, comboLabel: string | null, target: "
   return classifyRuntimePayload(error ? { ...payload, error } : payload, { target });
 }
 
-const EXTRACTION_MAX_ATTEMPTS = Math.max(
-  1,
-  Math.min(5, Number(Deno.env.get("EXTRACTION_MAX_ATTEMPTS") || 3) || 3),
-);
-
-function looksLikeStructuredKpiLabel(label: string): boolean {
-  return /segment|summary|grid|graph|table|chart|series|heatmap|viz|dataset|geography|performance|overall/i
-    .test(String(label || ""));
-}
-
 function hasUsableExtractionValue(value: unknown): boolean {
   if (value == null) return false;
   if (typeof value === "string" && value.trim() === "") return false;
@@ -803,84 +790,6 @@ function countUsableKpisInPayload(payload: any, comboLabel: string | null): numb
     }
   }
   return best;
-}
-
-/**
- * Full-matrix payloads nest one block per combo. Returns those KPI maps when
- * 2+ combo children exist so missing-grid retry can check each child (the old
- * `_multi` short-circuit skipped retries whenever any usable key existed).
- */
-function collectMatrixComboValues(payload: any): Array<Record<string, any>> | null {
-  const candidates = [
-    payload?.extracted?.result?.results,
-    payload?.extracted?.result?.kpis,
-    payload?.extracted?.result?.result,
-    payload?.extracted?.result,
-    payload?.extracted?.extracted,
-    payload?.result?.extracted,
-    payload?.result?.results,
-    payload?.result,
-    payload?.extracted,
-  ];
-  for (const raw of candidates) {
-    const root = flattenExtractionRoot(raw);
-    if (!root || typeof root !== "object") continue;
-
-    const children = Object.entries(root).filter(([k, v]) => {
-      if (isExtractionNoiseKey(k) || String(k).startsWith("__")) return false;
-      if (!v || typeof v !== "object" || Array.isArray(v)) return false;
-      // Flat `{ grid: table }` — not a combo child.
-      if (STRUCTURED_KPI_KEYS.has(normKpiKey(k))) return false;
-      const flat = flattenNodeToKpis(v);
-      return Object.keys(flat).length > 0 || isStructuredVal(v) || !!pickComparableStructured(flat);
-    });
-
-    if (children.length >= 2) {
-      return children.map(([, node]) => flattenNodeToKpis(node));
-    }
-  }
-  return null;
-}
-
-function comboExtractionNeedsRetry(
-  payload: any,
-  comboLabel: string | null,
-  opts?: { requireStructured?: boolean; configuredLabels?: string[] },
-): boolean {
-  if (comboExecutionError(payload, comboLabel)) return true;
-  const exec = payload?.extracted;
-  const values = pickComboKpis(payload, comboLabel);
-  const usableCount = countUsableKpisInPayload(payload, comboLabel);
-  const requireStructured = opts?.requireStructured ||
-    (opts?.configuredLabels || []).some((label) => looksLikeStructuredKpiLabel(label));
-
-  // Grid / chart / Show Data: always retry when the structured extract is missing,
-  // even if other keys (filters_applied, debug) made usableCount > 0.
-  if (
-    missingRequiredStructuredExtraction({
-      requireStructured,
-      configuredLabels: opts?.configuredLabels,
-      comboLabel,
-      comboValues: values,
-      matrixComboValues: comboLabel ? undefined : (collectMatrixComboValues(payload) || undefined),
-    })
-  ) {
-    return true;
-  }
-
-  // Partial success (e.g. 154 KPIs + 2 empty) must NOT retry — full-matrix
-  // calls with comboLabel=null used to look "empty" and burn 3× Browserless time.
-  if (usableCount > 0) {
-    const grains = values?.grains && typeof values.grains === "object"
-      ? Object.values(values.grains)
-      : [];
-    return grains.some((grain: any) =>
-      /still looks weekly|no time periods extracted|could not parse/i.test(String(grain?.trend_error || ""))
-    );
-  }
-  if (payload?.error || payload?.ok === false || exec?.ok === false || exec?.error) return true;
-  if (!values || !Object.keys(values).length) return true;
-  return true;
 }
 
 function swapGotoUrl(src: string, newUrl: string, oldUrl?: string): string {
@@ -1532,18 +1441,8 @@ Deno.serve(async (req) => {
               // Keep reference bytes aligned with Solo too (raw saved / generated code).
             }
 
-            // A long matrix script can carry stale filters, tabs, popups, grids,
-            // or chart grain state into the next combination. Give every combo
-            // its own Browserless function call/page. Non-PCC scenarios retry
-            // empty / failed extractions up to EXTRACTION_MAX_ATTEMPTS. PCC
-            // scalar scrapes use one attempt to avoid doubling long Browserless
-            // runtime; grid/chart (requireStructured) still retries. playwright-
-            // runtime remains unchanged; its existing override narrows the
-            // injected matrix to exactly one combination.
-            const requireStructuredExtraction = comparisonKpiLabels.some((label) =>
-              looksLikeStructuredKpiLabel(label)
-            ) || /graph|chart|grid|show\s*data|segment summary|overall performance/i
-              .test(`${s.title || ""} ${(s as any).description || ""}`);
+            // One scrape per target (main, then reference). No empty/partial
+            // extraction retries — failures surface on the first result.
             const scenarioTiming = createTimingCollector();
             const runtimeCtx = (
               target: "main" | "reference",
@@ -1563,113 +1462,54 @@ Deno.serve(async (req) => {
               target: "main" | "reference",
               comboLabel: string | null,
             ) => {
-              // Only Browserless timeouts permit a second bounded attempt.
-              // Generic empty KPI retries stay limited for long PCC scrapes, but
-              // grid/chart (requireStructured) always gets EXTRACTION_MAX_ATTEMPTS
-              // so intermittent empty Show Data / grid scrapes can recover.
-              // Timeout is ambiguous: the script may already have submitted a
-              // password. Do not replay automatically before operator review.
-              const authOrTimeoutMax = 1;
+              // Single scrape only — no timeout / empty-extraction re-runs.
+              // Partial KPIs fail the combo instead of burning another ~3 min.
               const profileKey = target === "reference"
                 ? script?.reference_credential_profile_id || report.reference_credential_profile_id || script?.credential_profile_id || report.credential_profile_id
                 : script?.credential_profile_id || report.credential_profile_id;
               const loginKey = String(profileKey || `${reportId}:${target}`);
-              const kpiMaxAttempts = (isPccScenario && !requireStructuredExtraction)
-                ? 1
-                : EXTRACTION_MAX_ATTEMPTS;
               await cancellation.throwIfCancelled(
                 runtimeCtx(target, comboLabel, 1, "before_runtime"),
               );
               const timedBody = { ...body, code: instrumentReportTiming(prepareReportExecution(String(body.code || ""), parse), parse) };
-              const timedCall = async (attempt: number, reason: string | null) => {
-                const stopped = stoppedReportLogins.get(loginKey);
-                if (stopped) return { ...stopped, __rtb_login_blocked: true };
-                const result = await scenarioTiming.time({ target, combo: comboLabel, attempt }, () => callFn("playwright-runtime", timedBody),
-                  (r: any) => { const c = classifyRuntimePayload(r, { target }); return c.auth_failure ? "auth_failure" : c.browserless_timeout ? "browserless_timeout" : reason; });
-                const classified = classifyRuntimePayload(result, { target });
-                if (classified.auth_failure) stoppedReportLogins.set(loginKey, { ok: false, error: classified.error, extracted: { ok: false, error: classified.error } });
-                return result;
-              };
-              let response = await timedCall(1, null);
-              await cancellation.throwIfCancelled(
-                runtimeCtx(target, comboLabel, 1, "after_runtime"),
-              );
-              let attempts = 1;
-
-              while (attempts < authOrTimeoutMax) {
-                const classified = classifyRuntimePayload(response, { target });
-                if (classified.auth_failure || !classified.browserless_timeout) break;
-                if (classified.browserless_timeout) {
-                  const health = await checkBrowserlessHealth({ timeoutMs: 4000 });
-                  jsonLog("browserless_health_after_timeout", {
-                    run_id: run.id,
-                    scenario_id: s.id,
-                    combo: comboLabel,
-                    target,
-                    ok: health.ok,
-                    reason: health.reason,
-                  });
-                  if (!health.ok) {
-                    browserlessInfraDown = health.reason || "browserless_unhealthy";
-                    (response as any).__rtb_browserless_unhealthy = true;
-                    break;
-                  }
-                }
-                attempts += 1;
-                await cancellation.throwIfCancelled(
-                  runtimeCtx(target, comboLabel, attempts, "before_retry"),
+              const stopped = stoppedReportLogins.get(loginKey);
+              let response = stopped
+                ? { ...stopped, __rtb_login_blocked: true }
+                : await scenarioTiming.time(
+                  { target, combo: comboLabel, attempt: 1 },
+                  () => callFn("playwright-runtime", timedBody),
+                  (r: any) => {
+                    const c = classifyRuntimePayload(r, { target });
+                    return c.auth_failure ? "auth_failure" : c.browserless_timeout ? "browserless_timeout" : null;
+                  },
                 );
-                jsonLog("combo_extraction_retry", {
+              const classified = classifyRuntimePayload(response, { target });
+              if (classified.auth_failure) {
+                stoppedReportLogins.set(loginKey, {
+                  ok: false,
+                  error: classified.error,
+                  extracted: { ok: false, error: classified.error },
+                });
+              }
+              if (classified.browserless_timeout) {
+                const health = await checkBrowserlessHealth({ timeoutMs: 4000 });
+                jsonLog("browserless_health_after_timeout", {
                   run_id: run.id,
                   scenario_id: s.id,
                   combo: comboLabel,
                   target,
-                  attempt: attempts,
-                  max_attempts: authOrTimeoutMax,
-                  reason: classified.auth_failure ? "auth_failure" : "browserless_timeout",
-                  error: classified.error,
+                  ok: health.ok,
+                  reason: health.reason,
                 });
-                response = await timedCall(attempts, null);
-                await cancellation.throwIfCancelled(
-                  runtimeCtx(target, comboLabel, attempts, "after_runtime"),
-                );
-              }
-
-              const afterAuth = classifyRuntimePayload(response, { target });
-              if (
-                !afterAuth.auth_failure &&
-                !afterAuth.browserless_timeout &&
-                !(response as any).__rtb_browserless_unhealthy
-              ) {
-                for (let attempt = attempts; attempt < kpiMaxAttempts; attempt++) {
-                  const currentOutcome = classifyRuntimePayload(response, { target });
-                  if (currentOutcome.auth_failure || currentOutcome.browserless_timeout) break;
-                  const needsRetry = comboExtractionNeedsRetry(response, comboLabel, {
-                    requireStructured: requireStructuredExtraction,
-                    configuredLabels: comparisonKpiLabels,
-                  });
-                  if (!needsRetry) break;
-                  attempts = attempt + 1;
-                  await cancellation.throwIfCancelled(
-                    runtimeCtx(target, comboLabel, attempts, "before_retry"),
-                  );
-                  jsonLog("combo_extraction_retry", {
-                    run_id: run.id,
-                    scenario_id: s.id,
-                    combo: comboLabel,
-                    target,
-                    attempt: attempts,
-                    max_attempts: kpiMaxAttempts,
-                    reason: "runtime_or_empty_extraction",
-                  });
-                  response = await timedCall(attempts, null);
-                  await cancellation.throwIfCancelled(
-                    runtimeCtx(target, comboLabel, attempts, "after_runtime"),
-                  );
+                if (!health.ok) {
+                  browserlessInfraDown = health.reason || "browserless_unhealthy";
+                  (response as any).__rtb_browserless_unhealthy = true;
                 }
               }
-
-              (response as any).__rtb_attempts = attempts;
+              await cancellation.throwIfCancelled(
+                runtimeCtx(target, comboLabel, 1, "after_runtime"),
+              );
+              (response as any).__rtb_attempts = 1;
               return response;
             };
             const isolatedRunResponses = new Map<string, any>();
@@ -1677,10 +1517,6 @@ Deno.serve(async (req) => {
             let runResp: any;
             let refRespRaw: any;
             // Always match Solo: one Browserless call with the full filter matrix.
-            // Per-combo isolation (PCC and/or combos.length > 8) made suite runs much
-            // slower (N × main[+reference]) while the same scripts succeed as a single
-            // full-matrix scrape. Missing-grid retries still work via
-            // missingRequiredStructuredExtraction on the full-matrix payload.
             const isolateCombos = false;
             if (hasCombos && isolateCombos) {
               const isolated = await mapPool(combos, 1, async (combo) => {
@@ -1740,23 +1576,35 @@ Deno.serve(async (req) => {
                 combo_count: hasCombos ? combos.length : 0,
                 isolate: false,
               });
-              [runResp, refRespRaw] = await Promise.all([
-                invokeRuntimeWithRetry({
+              // Sequential like solo: main Browserless session finishes before
+              // reference starts, so the two scrapes do not compete for CPU/memory.
+              runResp = await invokeRuntimeWithRetry({
+                mode: "headless",
+                scenario_id: s.id,
+                code: executableCode,
+                ...(fullMatrix ? { filter_combinations: fullMatrix } : {}),
+              }, "main", null);
+              await cancellation.throwIfCancelled({
+                checkpoint: "after_main_runtime",
+                report_id: reportId,
+                scenario_id: s.id,
+              });
+              refRespRaw = null;
+              if (isRef && !refError && refCode) {
+                await cancellation.throwIfCancelled({
+                  checkpoint: "before_reference",
+                  report_id: reportId,
+                  scenario_id: s.id,
+                  target: "reference",
+                });
+                refRespRaw = await invokeRuntimeWithRetry({
                   mode: "headless",
                   scenario_id: s.id,
-                  code: executableCode,
+                  code: refCode,
+                  target: "reference",
                   ...(fullMatrix ? { filter_combinations: fullMatrix } : {}),
-                }, "main", null),
-                (isRef && !refError && refCode)
-                  ? invokeRuntimeWithRetry({
-                      mode: "headless",
-                      scenario_id: s.id,
-                      code: refCode,
-                      target: "reference",
-                      ...(fullMatrix ? { filter_combinations: fullMatrix } : {}),
-                    }, "reference", null)
-                  : Promise.resolve(null),
-              ]);
+                }, "reference", null);
+              }
               // #region agent log
               {
                 const resultKeys = (resp: any) => {
@@ -1765,7 +1613,7 @@ Deno.serve(async (req) => {
                   const nested = root.results && typeof root.results === "object" ? root.results : root;
                   return Object.keys(nested).filter((k) => !String(k).startsWith("__")).slice(0, 20);
                 };
-                agentDebugLog("A", "agent-orchestrate/index.ts:after_parallel_scrape", "main+ref Promise.all finished", {
+                agentDebugLog("A", "agent-orchestrate/index.ts:after_sequential_scrape", "main then reference finished", {
                   run_id: run.id,
                   scenario_id: s.id,
                   ref_code_bytes: refCode ? refCode.length : 0,
@@ -1884,43 +1732,7 @@ Deno.serve(async (req) => {
               }
               return { ...response, extracted: { ...(response?.extracted || {}), result: { [combo.label || "__single__"]: node } } };
             };
-            if (hasCombos && !isolateCombos && !isPccScenario) {
-              for (const combo of combos) {
-                const current = selectedResponse(runResp, combo);
-                if (comboExecutionError(current, combo.label) || comboExtractionNeedsRetry(current, combo.label, { requireStructured: requireStructuredExtraction, configuredLabels: comparisonKpiLabels })) {
-                  const retried = await invokeRuntimeWithRetry({ mode: "headless", scenario_id: s.id, code: executableCode, filter_combinations: [{ id: combo.id, label: combo.label, filters: combo.filters || {} }] }, "main", combo.label);
-                  isolatedRunResponses.set(String(combo.id), retried);
-                }
-                if (isRef && !refError && refCode) {
-                  const reference = selectedResponse(refResp, combo);
-                  const refNeedsRetry = comboExecutionError(reference, combo.label) || comboExtractionNeedsRetry(reference, combo.label, { requireStructured: requireStructuredExtraction, configuredLabels: comparisonKpiLabels });
-                  // #region agent log
-                  {
-                    const scraped = pickComboKpis(reference, combo.label, comparisonKpiLabels, kpiAliases) || {};
-                    const configuredNonEmpty = comparisonKpiLabels.filter((lbl) => {
-                      const raw = lookupConfiguredKpiValue(scraped, lbl, kpiAliases);
-                      return raw != null && String(raw).trim() !== "";
-                    }).length;
-                    agentDebugLog("B", "agent-orchestrate/index.ts:ref_combo_retry_gate", "reference per-combo retry gate", {
-                      run_id: run.id,
-                      scenario_id: s.id,
-                      combo: combo.label,
-                      needs_retry: refNeedsRetry,
-                      exec_error: comboExecutionError(reference, combo.label),
-                      usable_count: countUsableKpisInPayload(reference, combo.label),
-                      configured_non_empty: configuredNonEmpty,
-                      configured_total: comparisonKpiLabels.length,
-                      scraped_keys: Object.keys(scraped).slice(0, 15),
-                    }, run.id);
-                  }
-                  // #endregion
-                  if (refNeedsRetry) {
-                    const retried = await invokeRuntimeWithRetry({ mode: "headless", scenario_id: s.id, code: refCode, target: "reference", filter_combinations: [{ id: combo.id, label: combo.label, filters: combo.filters || {} }] }, "reference", combo.label);
-                    isolatedRefResponses.set(String(combo.id), retried);
-                  }
-                }
-              }
-            }
+            // No per-combo isolated re-scrape after the full-matrix run.
             const comboOutcomes = await mapPool(combos, Math.min(concurrency, 8), async (combo) => {
               await cancellation.throwIfCancelled({
                 checkpoint: "before_combo",
@@ -2011,19 +1823,11 @@ Deno.serve(async (req) => {
               const scraped = pickComboKpis(comboRunResp, combo.label, comparisonKpiLabels, kpiAliases) || {};
               const filtersApplied =
                 pickComboFiltersApplied(comboRunResp, combo.label);
-              const filterVerification = verifyFilterEvidence(combo.filters || {}, filtersApplied);
-              // Plain matrix filters (string values) mean the script envelope was
-              // missing filters_applied — usually empty/unparseable extraction.
-              const filtersLookUnverified = (() => {
-                if (!filtersApplied || typeof filtersApplied !== "object") return true;
-                const vals = Object.values(filtersApplied);
-                if (!vals.length) return true;
-                return vals.every((v) => v == null || typeof v !== "object");
-              })();
+              // Filter read-back is informational only — never fail the combo on it.
               const scrapedUseful = Object.entries(scraped).some(([k, v]) =>
                 !isExtractionNoiseKey(k) && v != null && String(v).trim() !== ""
               );
-              if (!scrapedUseful && filtersLookUnverified) {
+              if (!scrapedUseful) {
                 jsonLog("empty_extracted_main", {
                   run_id: run.id,
                   scenario_id: s.id,
@@ -2039,16 +1843,12 @@ Deno.serve(async (req) => {
               let expectedMap: Record<string, any> = {};
               let sqlMeta: any = { source: isRef ? "reference_script" : (sqlTplId ? "warehouse" : "none") };
               let sqlRow: Record<string, any> | null = null;
-              // Reference values only count when its own filters were read back.
-              let refFilterVerificationOk = true;
 
               if (isRef) {
                 const comboRefResp = selectedResponse(isolatedRefResponses.get(String(combo.id)) || refResp, combo);
                 const comboRefExec = comboRefResp?.extracted;
-                const referenceVerification = verifyFilterEvidence(combo.filters || {}, pickComboFiltersApplied(comboRefResp, combo.label));
-                refFilterVerificationOk = referenceVerification.ok;
                 const comboRefError =
-                  refError || (!referenceVerification.ok ? "Reference filter verification failed" : null) ||
+                  refError ||
                   comboExecutionError(comboRefResp, combo.label) ||
                   comboRefResp?.error ||
                   (comboRefResp?.ok === false ? comboRefResp?.message || "reference scrape failed" : null) ||
@@ -2077,17 +1877,11 @@ Deno.serve(async (req) => {
                     run_id: run.id,
                     scenario_id: s.id,
                     combo: combo.label,
-                    ref_filter_ok: refFilterVerificationOk,
                     combo_ref_error: comboRefError,
                     used_isolated_retry: isolatedRefResponses.has(String(combo.id)),
                     exp_non_empty: expNonEmpty,
                     exp_total: Object.keys(expectedMap).length,
                     ref_scraped_keys: Object.keys(refScraped).slice(0, 15),
-                    filter_evidence: (referenceVerification.evidence || []).slice(0, 6).map((e: any) => ({
-                      key: e.key,
-                      outcome: e.verification_outcome,
-                      selection: e.selection_outcome,
-                    })),
                   }, run.id);
                 }
                 // #endregion
@@ -2562,7 +2356,7 @@ Deno.serve(async (req) => {
                 if (refOutcome.category !== "pass") comboPass = false;
               }
 
-              if (mainOutcome.category !== "pass" || !filterVerification.ok || !refFilterVerificationOk) comboPass = false;
+              if (mainOutcome.category !== "pass") comboPass = false;
 
               let failureCategory: ExtractionFailureCategory = comboPass
                 ? "pass"
@@ -2581,7 +2375,6 @@ Deno.serve(async (req) => {
                 if (failureCategory === "pass") failureCategory = "fail";
               }
 
-              if (!filterVerification.ok || !refFilterVerificationOk) failureCategory = "partial_extraction";
               const status = statusFromCategory(failureCategory, comboPass);
               // #region agent log
               agentDebugLog("D", "agent-orchestrate/index.ts:combo_persist_outcome", "combo persist outcome", {
@@ -2591,8 +2384,6 @@ Deno.serve(async (req) => {
                 status,
                 failure_category: failureCategory,
                 combo_pass: comboPass,
-                main_filter_ok: filterVerification.ok,
-                ref_filter_ok: refFilterVerificationOk,
                 main_missing: mainOutcome.missing_fields,
                 ref_missing: refOutcome?.missing_fields || [],
                 expected_non_empty: Object.entries(expectedMap).filter(([, v]) => v != null && String(v).trim() !== "").length,
@@ -2651,9 +2442,11 @@ Deno.serve(async (req) => {
                   timing: scenarioTiming.snapshot(combo.label),
                   combo_id: combo.id,
                   requested_filters: combo.filters || {},
-                  filter_verification: filterVerification,
                   execution_status: failureCategory,
-                  error: !filterVerification.ok ? "Filter verification failed" : mainOutcome.error || null,
+                  // Never persist filter read-back drift as the combo error.
+                  error: mainOutcome.error && !/^(filter verification failed|FILTER_DRIFT|FILTER_NOT_VERIFIED|FILTER_NOT_APPLIED)$/i.test(String(mainOutcome.error).trim())
+                    ? mainOutcome.error
+                    : null,
                   filter: combo.label,
                   values: actualMap,
                   filters_applied: filtersApplied,

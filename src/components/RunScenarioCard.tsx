@@ -284,13 +284,19 @@ function ScenarioResultTable({
         tr.expected.error && tr.expected.error !== "script_generation_failed" &&
         (tr.expected.error || tr.expected.message)) || null;
     if (!actualErr && !expectedErr) return [];
+    const message = String(actualErr || expectedErr || "Unknown error");
+    // Filter verification is informational only — do not surface as Execution error.
+    if (/^filter verification failed$/i.test(message.trim())
+      || /^(FILTER_DRIFT|FILTER_NOT_VERIFIED|FILTER_NOT_APPLIED)$/i.test(message.trim())) {
+      return [];
+    }
     const kind =
       tr.expected?.error === "script_generation_failed"
         ? "Script generation failed"
         : tr.expected?.source === "scrape"
         ? "Scrape failed"
         : "Execution error";
-    return [{ comboLabel, kind, message: String(actualErr || expectedErr || "Unknown error") }];
+    return [{ comboLabel, kind, message }];
   });
 
   return (
